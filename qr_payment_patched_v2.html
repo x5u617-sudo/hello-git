@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QR Payment — v2 (Patched)</title>
+<style>
+  :root{--bg:#f7f7f8;--card:#fff;--border:#e5e7eb;--text:#0f172a;--muted:#6b7280;--primary:#0ea5e9;--danger:#ef4444;--ok:#10b981;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue","Noto Sans Arabic",Arial}
+  header{background:#fff;border-bottom:1px solid var(--border)}
+  .container{max-width:1100px;margin:0 auto;padding:16px}
+  .row{display:grid;gap:16px}
+  @media(min-width:960px){.row-2{grid-template-columns:1fr 1fr}}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .hd{padding:14px 16px;border-bottom:1px solid var(--border);font-weight:600}
+  .bd{padding:16px}
+  .btn{padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:#fff;cursor:pointer;user-select:none}
+  .btn.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+  .btn.ok{background:var(--ok);border-color:var(--ok);color:#fff}
+  .btn.danger{background:var(--danger);border-color:var(--danger);color:#fff}
+  label{font-size:13px;color:var(--muted)}
+  input,select,textarea{width:100%;padding:10px;border:1px solid var(--border);border-radius:10px;background:#fff}
+  .grid{display:grid;gap:10px}
+  .grid-2{grid-template-columns:1fr 1fr}
+  .muted{color:var(--muted)} .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",monospace}
+  .qr{display:inline-grid;place-items:center;padding:8px;border:1px dashed var(--border);border-radius:12px;background:#fff}
+  .banner{padding:8px 10px;border-radius:10px;background:#fff8e1;border:1px solid #fde68a;color:#92400e;margin:8px 0;display:none}
+</style>
+</head>
+<body>
+<header>
+  <div class="container">
+    <div><strong>QR Payment</strong> <span class="muted">• تدفّق العميل → التاجر</span></div>
+  </div>
+</header>
+
+<main class="container" id="app"></main>
+
+<footer class="container" style="margin-top:24px;padding:12px;border-top:1px solid var(--border);color:#6b7280;font-size:12px">
+  Prototype • v2 Patched • In‑Memory • Daily limit 4000 SAR
+</footer>
+
+<script>
+(() => {
+  // --- Small diagnostic banner ---
+  const diag = (msg) => {
+    let b = document.getElementById('diag');
+    if(!b){ b=document.createElement('div'); b.id='diag'; b.className='banner'; document.querySelector('#app').prepend(b); }
+    b.textContent = msg || ''; b.style.display = msg ? 'block':'none';
+    console.log('[diag]', msg);
+  };
+
+  // Remove any global key blocks that might interfere
+  window.onkeydown = null;
+  document.onkeydown = null;
+  document.addEventListener('contextmenu', e => {}); // do NOT block right click here
+
+  // --- State ---
+  const STATE = { route:'customer', txns:[], activeId:'' };
+  const CURRENCY='SAR', DAILY_LIMIT=4000;
+  const todayKey=()=>new Date().toISOString().slice(0,10);
+  const dailyUsage=new Map();
+  const genId=()=>`TXN-${Date.now()}-${Math.random().toString(36).slice(2,8).toUpperCase()}`;
+  const nowISO=()=>new Date().toISOString();
+  const getDailyUsed=(cid)=>dailyUsage.get(`${cid}:${todayKey()}`)||0;
+  const addDailyUsed=(cid,amt)=>{
+    const k=`${cid}:${todayKey()}`;
+    dailyUsage.set(k,(dailyUsage.get(k)||0)+Number(amt||0));
+  };
+  const active=()=>STATE.txns.find(x=>x.id===STATE.activeId);
+
+  // --- Payload helpers (with correct "
+") ---
+  function buildEmvPayload({ merchantId, amount, currency, txnId, ttlSec, op, customerId, merchantName }){
+    const expiry = Date.now() + ttlSec*1000;
+    return [
+      "000201", "01EMVCPM",
+      `52OP:${op}`,
+      `53CUR:${currency}`,
+      `54AMT:${Number(amount).toFixed(2)}`,
+      `59MERCHANT:${merchantName||merchantId}`,
+      `61CUST:${customerId}`,
+      `62TXN:${txnId}`,
+      `63EXP:${expiry}`
+    ].join("\n");
+  }
+  function parseDemoEmv(payload){
+    const lines = (payload||"").split("\n");
+    const map = {};
+    for(const ln of lines){
+      if(ln.startsWith("52OP:")) map.op = ln.split(":")[1];
+      if(ln.startsWith("53CUR:")) map.currency = ln.split(":")[1];
+      if(ln.startsWith("54AMT:")) map.amount = ln.split(":")[1];
+      if(ln.startsWith("59MERCHANT:")) map.merchant = ln.split(":")[1];
+      if(ln.startsWith("61CUST:")) map.customerId = ln.split(":")[1];
+      if(ln.startsWith("62TXN:")) map.txnId = ln.split(":")[1];
+      if(ln.startsWith("63EXP:")) map.expiresAt = Number(ln.split(":")[1]);
+    }
+    return map;
+  }
+
+  // --- Actions ---
+  function createTxn({ amount, ttlSec, merchantId, merchantName, op, customerId }){
+    try{
+      const used = getDailyUsed(customerId);
+      const remaining = Math.max(0, DAILY_LIMIT - used);
+      const num = Number(amount||0), ttl = Number(ttlSec||0);
+      if(!(Number.isFinite(num) && num>0)) return diag("الرجاء إدخال مبلغ صالح");
+      if(num>remaining) return diag(`تجاوزت الحد اليومي ${DAILY_LIMIT}، المتبقي: ${remaining}`);
+      if(!(Number.isFinite(ttl) && ttl>=30)) return diag("TTL يجب أن يكون 30 ثانية أو أكثر");
+
+      const id = genId();
+      const payload = buildEmvPayload({ merchantId, merchantName, amount:num, currency:CURRENCY, txnId:id, ttlSec:ttl, op, customerId });
+      const expiresAt = Date.now() + ttl*1000;
+      const rec = { id, op, amount:num, currency:CURRENCY, merchantId, merchantName, customerId, status:"NEW", createdAt: nowISO(), expiresAt, payload };
+      STATE.txns.unshift(rec); STATE.activeId=id;
+      diag(""); render();
+    }catch(e){ console.error(e); diag("حدث خطأ أثناء إنشاء QR"); }
+  }
+  function confirmTxn(outcome){
+    const t = active(); if(!t) return diag("لا توجد عملية نشطة");
+    if(Date.now()>(t.expiresAt||0)) { t.status="EXPIRED"; diag("انتهت صلاحية الطلب"); render(); return; }
+    t.status = outcome;
+    if(outcome==="SUCCESS") addDailyUsed(t.customerId, t.amount);
+    render();
+  }
+
+  // --- Elements helpers ---
+  const el = (tag, attrs={}, children=[]) => {
+    const e = document.createElement(tag);
+    for(const k in attrs){
+      if(k==="class") e.className = attrs[k];
+      else if(k.startsWith("on") && typeof attrs[k]==="function") e.addEventListener(k.slice(2), attrs[k]);
+      else e.setAttribute(k, attrs[k]);
+    }
+    (Array.isArray(children)?children:[children]).forEach(c => {
+      if(c==null) return;
+      e.appendChild(typeof c==="string" ? document.createTextNode(c) : c);
+    });
+    return e;
+  };
+
+  // --- Views ---
+  function viewCustomer(){
+    const merchants=[{id:"M-PN-NKHL",name:"بنده النخيل"},{id:"M-CRF-TKH",name:"كارفور التحلية"},{id:"M-PH-RYD",name:"صيدلية النهدي — الرياض"}];
+    let op="DEPOSIT", customerId="CUST-9665****123", merchantId=merchants[0].id, merchantName=merchants[0].name, amount=250, ttl=180;
+
+    const wrap = el('div',{class:'row'});
+
+    // Step 1: Operation
+    const card1 = el('div',{class:'card'});
+    card1.appendChild(el('div',{class:'hd'},["1) نوع العملية"]));
+    const depositBtn = el('button',{class:'btn primary',type:'button',onclick:()=>{op="DEPOSIT";depositBtn.className='btn primary';withdrawBtn.className='btn';}},["إيداع (Cash‑In)"]);
+    const withdrawBtn= el('button',{class:'btn',type:'button',onclick:()=>{op="WITHDRAW";withdrawBtn.className='btn primary';depositBtn.className='btn';}},["سحب (Cash‑Out)"]);
+    card1.appendChild(el('div',{class:'bd'},[depositBtn, el('span',{style:'margin:0 6px'}), withdrawBtn]));
+    wrap.appendChild(card1);
+
+    // Step 2: Merchant
+    const card2 = el('div',{class:'card'});
+    card2.appendChild(el('div',{class:'hd'},["2) اختر التاجر الأقرب"]));
+    const sel = el('select',{onchange:(e)=>{merchantId=e.target.value; merchantName=merchants.find(m=>m.id===merchantId)?.name||merchantId;}},
+      merchants.map(m=>el('option',{value:m.id},[m.name])));
+    card2.appendChild(el('div',{class:'bd'},[sel, el('div',{class:'muted',style:'margin-top:6px'},["المختار: ", el('b',{},[merchantName])])]));
+    wrap.appendChild(card2);
+
+    // Step 3: Amount + TTL + Create
+    const card3 = el('div',{class:'card'});
+    card3.appendChild(el('div',{class:'hd'},["3) المبلغ والحد اليومي"]));
+    const used = getDailyUsed(customerId), remaining = Math.max(0, DAILY_LIMIT-used);
+    const amt = el('input',{type:'number',value:String(amount),min:'1',step:'0.01',oninput:(e)=>{amount=parseFloat(e.target.value||'0');}});
+    const ttlInp = el('input',{type:'number',value:String(ttl),min:'30',oninput:(e)=>{ttl=parseInt(e.target.value||'0',10);}});
+    const createBtn = el('button',{class:'btn primary',type:'button',onclick:()=>createTxn({amount,ttlSec:ttl,merchantId,merchantName,op,customerId})},["إنشاء كود QR للعميل"]);
+    const bd3 = el('div',{class:'bd'},[
+      el('div',{class:'grid grid-2'},[
+        el('div',{},[el('label',{},[`Amount (${CURRENCY})`]), amt]),
+        el('div',{},[el('label',{},["TTL (sec)"]), ttlInp])
+      ]),
+      el('div',{class:'muted',style:'margin-top:6px'},[`المستخدم اليوم: ${used.toFixed(2)} / ${DAILY_LIMIT} — المتبقي: ${remaining.toFixed(2)}`]),
+      el('div',{style:'margin-top:10px'},[createBtn])
+    ]);
+    card3.appendChild(bd3); wrap.appendChild(card3);
+
+    // Preview (simple)
+    const a = active();
+    if(a){
+      const card4 = el('div',{class:'card'});
+      card4.appendChild(el('div',{class:'hd'},["QR جاهز — اعرضه على التاجر"]));
+      const qrBox = el('div',{class:'qr'},["QRCode"]);
+      const p = el('div',{class:'muted',style:'margin-top:8px'},[`txnId: `, el('span',{class:'mono'},[a.id]), ` • expires in: ${Math.max(0,Math.floor((a.expiresAt-Date.now())/1000))}s`]);
+      const goMerch = el('button',{class:'btn',type:'button',onclick:()=>{STATE.route='merchant';render();}},["الانتقال لواجهة التاجر"]);
+      card4.appendChild(el('div',{class:'bd'},[qrBox,p,el('div',{style:'margin-top:8px'},[goMerch])]));
+      wrap.appendChild(card4);
+    }
+
+    return wrap;
+  }
+
+  function viewMerchant(){
+    const a = active();
+    const wrap = el('div',{class:'row row-2'});
+    const c1 = el('div',{class:'card'});
+    c1.appendChild(el('div',{class:'hd'},["واجهة التاجر — تأكيد"]));
+    const b1 = el('div',{class:'bd'},[
+      a ? el('div',{},["سيتم استخدام بيانات QR النشطة (مخفية)."]) :
+          el('div',{class:'muted'},["أنشئ QR من صفحة العميل أولًا."])
+    ]);
+    c1.appendChild(b1); wrap.appendChild(c1);
+
+    const c2 = el('div',{class:'card'});
+    c2.appendChild(el('div',{class:'hd'},["تفاصيل العملية"]));
+    const b2 = el('div',{class:'bd'});
+    if(a){
+      b2.appendChild(el('div',{},[el('b',{},["op: "]), a.op]));
+      b2.appendChild(el('div',{},[el('b',{},["merchant: "]), a.merchantName]));
+      b2.appendChild(el('div',{},[el('b',{},["amount: "]), a.amount.toFixed(2)," ",a.currency]));
+      b2.appendChild(el('div',{},[el('b',{},["customer: "]), a.customerId]));
+      b2.appendChild(el('div',{},[el('b',{},["txnId: "]), el('span',{class:'mono'},[a.id])]));
+      const btns = el('div',{},[
+        el('button',{class:'btn ok',type:'button',onclick:()=>confirmTxn('SUCCESS')},["تأكيد (SUCCESS)"]),
+        el('button',{class:'btn danger',type:'button',onclick:()=>confirmTxn('FAILED')},["رفض (FAILED)"]),
+      ]);
+      btns.style.marginTop="8px"; b2.appendChild(btns);
+    } else {
+      b2.appendChild(el('div',{class:'muted'},["لا توجد عملية نشطة."]));
+    }
+    c2.appendChild(b2); wrap.appendChild(c2);
+    return wrap;
+  }
+
+  function viewReceipt(){
+    const t = active();
+    const wrap = el('div',{class:'row'});
+    const c = el('div',{class:'card'});
+    c.appendChild(el('div',{class:'hd'},["الإيصال"]));
+    const b = el('div',{class:'bd'});
+    if(!t){ b.appendChild(el('div',{class:'muted'},["لا توجد عملية"])); }
+    else {
+      const title = {SUCCESS:"تمت العملية",FAILED:"فشلت العملية"}[t.status]||t.status;
+      b.appendChild(el('div',{style:'font-weight:700;margin-bottom:8px'},[title]));
+      b.appendChild(el('div',{},[`txnId: `, el('span',{class:'mono'},[t.id])]));
+    }
+    c.appendChild(b); wrap.appendChild(c); return wrap;
+  }
+
+  function render(){
+    const app = document.getElementById('app'); app.innerHTML='';
+    const nav = el('div',{style:'display:flex;gap:8px;margin-bottom:12px'},[
+      el('button',{class:'btn',type:'button',onclick:()=>{STATE.route='customer';render();}},["تطبيق العميل"]),
+      el('button',{class:'btn',type:'button',onclick:()=>{STATE.route='merchant';render();}},["واجهة التاجر"]),
+      el('button',{class:'btn',type:'button',onclick:()=>{STATE.route='receipt';render();}},["الإيصال"]),
+    ]);
+    app.appendChild(nav);
+    if(STATE.route==='customer') app.appendChild(viewCustomer());
+    if(STATE.route==='merchant') app.appendChild(viewMerchant());
+    if(STATE.route==='receipt') app.appendChild(viewReceipt());
+  }
+
+  // auto-expire timer
+  setInterval(()=>{
+    const now = Date.now(); let ch=false;
+    for(const t of STATE.txns){ if(t.status==='NEW' && t.expiresAt && now>t.expiresAt){ t.status='EXPIRED'; ch=true; } }
+    if(ch) render();
+  },1000);
+
+  render();
+})();</script>
+</body>
+</html>
